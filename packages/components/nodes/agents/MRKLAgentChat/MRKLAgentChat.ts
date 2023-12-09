@@ -1,12 +1,15 @@
-import { INode, INodeData, INodeParams } from '../../../src/Interface'
+import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { initializeAgentExecutorWithOptions, AgentExecutor } from 'langchain/agents'
-import { BaseChatModel } from 'langchain/chat_models/base'
 import { getBaseClasses } from '../../../src/utils'
 import { Tool } from 'langchain/tools'
+import { BaseLanguageModel } from 'langchain/base_language'
+import { flatten } from 'lodash'
+import { additionalCallbacks } from '../../../src/handler'
 
 class MRKLAgentChat_Agents implements INode {
     label: string
     name: string
+    version: number
     description: string
     type: string
     icon: string
@@ -15,12 +18,13 @@ class MRKLAgentChat_Agents implements INode {
     inputs: INodeParams[]
 
     constructor() {
-        this.label = 'MRKL Agent for Chat Models'
+        this.label = 'ReAct Agent for Chat Models'
         this.name = 'mrklAgentChat'
+        this.version = 1.0
         this.type = 'AgentExecutor'
         this.category = 'Agents'
         this.icon = 'agent.svg'
-        this.description = 'Agent that uses the ReAct Framework to decide what action to take, optimized to be used with Chat Models'
+        this.description = 'Agent that uses the ReAct logic to decide what action to take, optimized to be used with Chat Models'
         this.baseClasses = [this.type, ...getBaseClasses(AgentExecutor)]
         this.inputs = [
             {
@@ -30,27 +34,30 @@ class MRKLAgentChat_Agents implements INode {
                 list: true
             },
             {
-                label: 'Chat Model',
+                label: 'Language Model',
                 name: 'model',
-                type: 'BaseChatModel'
+                type: 'BaseLanguageModel'
             }
         ]
     }
 
     async init(nodeData: INodeData): Promise<any> {
-        const model = nodeData.inputs?.model as BaseChatModel
+        const model = nodeData.inputs?.model as BaseLanguageModel
         let tools = nodeData.inputs?.tools as Tool[]
-        tools = tools.flat()
+        tools = flatten(tools)
         const executor = await initializeAgentExecutorWithOptions(tools, model, {
             agentType: 'chat-zero-shot-react-description',
-            verbose: true
+            verbose: process.env.DEBUG === 'true' ? true : false
         })
         return executor
     }
 
-    async run(nodeData: INodeData, input: string): Promise<string> {
+    async run(nodeData: INodeData, input: string, options: ICommonObject): Promise<string> {
         const executor = nodeData.instance as AgentExecutor
-        const result = await executor.call({ input })
+
+        const callbacks = await additionalCallbacks(nodeData, options)
+
+        const result = await executor.call({ input }, [...callbacks])
 
         return result?.output
     }

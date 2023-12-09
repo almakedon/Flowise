@@ -2,6 +2,10 @@ import { ICommonObject, INode, INodeData as INodeDataFromComponent, INodeParams 
 
 export type MessageType = 'apiMessage' | 'userMessage'
 
+export enum chatType {
+    INTERNAL = 'INTERNAL',
+    EXTERNAL = 'EXTERNAL'
+}
 /**
  * Databases
  */
@@ -9,10 +13,14 @@ export interface IChatFlow {
     id: string
     name: string
     flowData: string
-    apikeyid: string
-    deployed: boolean
     updatedDate: Date
     createdDate: Date
+    deployed?: boolean
+    isPublic?: boolean
+    apikeyid?: string
+    analytic?: string
+    chatbotConfig?: string
+    apiConfig?: any
 }
 
 export interface IChatMessage {
@@ -20,10 +28,51 @@ export interface IChatMessage {
     role: MessageType
     content: string
     chatflowid: string
+    sourceDocuments?: string
+    usedTools?: string
+    fileAnnotations?: string
+    chatType: string
+    chatId: string
+    memoryType?: string
+    sessionId?: string
+    createdDate: Date
+}
+
+export interface ITool {
+    id: string
+    name: string
+    description: string
+    color: string
+    iconSrc?: string
+    schema?: string
+    func?: string
+    updatedDate: Date
+    createdDate: Date
+}
+
+export interface IAssistant {
+    id: string
+    details: string
+    credential: string
+    iconSrc?: string
+    updatedDate: Date
+    createdDate: Date
+}
+
+export interface ICredential {
+    id: string
+    name: string
+    credentialName: string
+    encryptedData: string
+    updatedDate: Date
     createdDate: Date
 }
 
 export interface IComponentNodes {
+    [key: string]: INode
+}
+
+export interface IComponentCredentials {
     [key: string]: INode
 }
 
@@ -115,6 +164,9 @@ export interface IncomingInput {
     question: string
     history: IMessage[]
     overrideConfig?: ICommonObject
+    socketIOClientId?: string
+    chatId?: string
+    stopNodeId?: string
 }
 
 export interface IActiveChatflows {
@@ -126,15 +178,28 @@ export interface IActiveChatflows {
     }
 }
 
+export interface IActiveCache {
+    [key: string]: Map<any, any>
+}
+
 export interface IOverrideConfig {
     node: string
+    nodeId: string
     label: string
     name: string
     type: string
 }
 
-export interface IDatabaseExport {
-    chatmessages: IChatMessage[]
-    chatflows: IChatFlow[]
-    apikeys: ICommonObject[]
+export type ICredentialDataDecrypted = ICommonObject
+
+// Plain credential object sent to server
+export interface ICredentialReqBody {
+    name: string
+    credentialName: string
+    plainDataObj: ICredentialDataDecrypted
+}
+
+// Decrypted credential object sent back to client
+export interface ICredentialReturnResponse extends ICredential {
+    plainDataObj: ICredentialDataDecrypted
 }
