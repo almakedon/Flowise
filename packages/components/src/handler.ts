@@ -1,25 +1,40 @@
-import { BaseTracer, Run, BaseCallbackHandler } from 'langchain/callbacks'
-import { AgentAction, ChainValues } from 'langchain/schema'
 import { Logger } from 'winston'
-import { Server } from 'socket.io'
+import { v4 as uuidv4 } from 'uuid'
 import { Client } from 'langsmith'
-import { LangChainTracer } from 'langchain/callbacks'
-import { LLMonitorHandler } from 'langchain/callbacks/handlers/llmonitor'
-import { getCredentialData, getCredentialParam } from './utils'
-import { ICommonObject, INodeData } from './Interface'
 import CallbackHandler from 'langfuse-langchain'
+import lunary from 'lunary'
 import { RunTree, RunTreeConfig, Client as LangsmithClient } from 'langsmith'
 import { Langfuse, LangfuseTraceClient, LangfuseSpanClient, LangfuseGenerationClient } from 'langfuse'
-import monitor from 'llmonitor'
-import { v4 as uuidv4 } from 'uuid'
+
+import { BaseCallbackHandler, NewTokenIndices, HandleLLMNewTokenCallbackFields } from '@langchain/core/callbacks/base'
+import { LangChainTracer, LangChainTracerFields } from '@langchain/core/tracers/tracer_langchain'
+import { BaseTracer, Run } from '@langchain/core/tracers/base'
+import { ChainValues } from '@langchain/core/utils/types'
+import { AgentAction } from '@langchain/core/agents'
+import { LunaryHandler } from '@langchain/community/callbacks/handlers/lunary'
+
+import { getCredentialData, getCredentialParam, getEnvironmentVariable } from './utils'
+import { ICommonObject, IDatabaseEntity, INodeData, IServerSideEventStreamer } from './Interface'
+import { LangWatch, LangWatchSpan, LangWatchTrace, autoconvertTypedValues } from 'langwatch'
+import { DataSource } from 'typeorm'
+import { ChatGenerationChunk } from '@langchain/core/outputs'
+import { AIMessageChunk } from '@langchain/core/messages'
 
 interface AgentRun extends Run {
     actions: AgentAction[]
 }
 
+function tryGetJsonSpaces() {
+    try {
+        return parseInt(getEnvironmentVariable('LOG_JSON_SPACES') ?? '2')
+    } catch (err) {
+        return 2
+    }
+}
+
 function tryJsonStringify(obj: unknown, fallback: string) {
     try {
-        return JSON.stringify(obj, null, 2)
+        return JSON.stringify(obj, null, tryGetJsonSpaces())
     } catch (err) {
         return fallback
     }
@@ -45,9 +60,10 @@ export class ConsoleCallbackHandler extends BaseTracer {
     constructor(logger: Logger) {
         super()
         this.logger = logger
+        if (getEnvironmentVariable('DEBUG') === 'true') {
+            logger.level = getEnvironmentVariable('LOG_LEVEL') ?? 'info'
+        }
     }
-
-    // utility methods
 
     getParents(run: Run) {
         const parents: Run[] = []
@@ -75,10 +91,9 @@ export class ConsoleCallbackHandler extends BaseTracer {
         return string
     }
 
-    // logging methods
-
     onChainStart(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
+
         this.logger.verbose(`[chain/start] [${crumbs}] Entering Chain run with input: ${tryJsonStringify(run.inputs, '[inputs]')}`)
     }
 
@@ -151,16 +166,16 @@ export class ConsoleCallbackHandler extends BaseTracer {
 export class CustomChainHandler extends BaseCallbackHandler {
     name = 'custom_chain_handler'
     isLLMStarted = false
-    socketIO: Server
-    socketIOClientId = ''
     skipK = 0 // Skip streaming for first K numbers of handleLLMStart
     returnSourceDocuments = false
     cachedResponse = true
+    chatId: string = ''
+    sseStreamer: IServerSideEventStreamer | undefined
 
-    constructor(socketIO: Server, socketIOClientId: string, skipK?: number, returnSourceDocuments?: boolean) {
+    constructor(sseStreamer: IServerSideEventStreamer | undefined, chatId: string, skipK?: number, returnSourceDocuments?: boolean) {
         super()
-        this.socketIO = socketIO
-        this.socketIOClientId = socketIOClientId
+        this.sseStreamer = sseStreamer
+        this.chatId = chatId
         this.skipK = skipK ?? this.skipK
         this.returnSourceDocuments = returnSourceDocuments ?? this.returnSourceDocuments
     }
@@ -170,18 +185,40 @@ export class CustomChainHandler extends BaseCallbackHandler {
         if (this.skipK > 0) this.skipK -= 1
     }
 
-    handleLLMNewToken(token: string) {
+    handleLLMNewToken(
+        token: string,
+        idx?: NewTokenIndices,
+        runId?: string,
+        parentRunId?: string,
+        tags?: string[],
+        fields?: HandleLLMNewTokenCallbackFields
+    ): void | Promise<void> {
         if (this.skipK === 0) {
             if (!this.isLLMStarted) {
                 this.isLLMStarted = true
-                this.socketIO.to(this.socketIOClientId).emit('start', token)
+                if (this.sseStreamer) {
+                    this.sseStreamer.streamStartEvent(this.chatId, token)
+                }
             }
-            this.socketIO.to(this.socketIOClientId).emit('token', token)
+            if (this.sseStreamer) {
+                if (token) {
+                    const chunk = fields?.chunk as ChatGenerationChunk
+                    const message = chunk?.message as AIMessageChunk
+                    const toolCalls = message?.tool_call_chunks || []
+
+                    // Only stream when token is not empty and not a tool call
+                    if (toolCalls.length === 0) {
+                        this.sseStreamer.streamTokenEvent(this.chatId, token)
+                    }
+                }
+            }
         }
     }
 
     handleLLMEnd() {
-        this.socketIO.to(this.socketIOClientId).emit('end')
+        if (this.sseStreamer) {
+            this.sseStreamer.streamEndEvent(this.chatId)
+        }
     }
 
     handleChainEnd(outputs: ChainValues, _: string, parentRunId?: string): void | Promise<void> {
@@ -191,24 +228,109 @@ export class CustomChainHandler extends BaseCallbackHandler {
             Callback Order is "Chain Start -> Chain End" for cached responses.
          */
         if (this.cachedResponse && parentRunId === undefined) {
-            const cachedValue = outputs.text ?? outputs.response ?? outputs.output ?? outputs.output_text
+            const cachedValue = outputs.text || outputs.response || outputs.output || outputs.output_text
             //split at whitespace, and keep the whitespace. This is to preserve the original formatting.
             const result = cachedValue.split(/(\s+)/)
             result.forEach((token: string, index: number) => {
                 if (index === 0) {
-                    this.socketIO.to(this.socketIOClientId).emit('start', token)
+                    if (this.sseStreamer) {
+                        this.sseStreamer.streamStartEvent(this.chatId, token)
+                    }
                 }
-                this.socketIO.to(this.socketIOClientId).emit('token', token)
+                if (this.sseStreamer) {
+                    this.sseStreamer.streamTokenEvent(this.chatId, token)
+                }
             })
-            if (this.returnSourceDocuments) {
-                this.socketIO.to(this.socketIOClientId).emit('sourceDocuments', outputs?.sourceDocuments)
+            if (this.returnSourceDocuments && this.sseStreamer) {
+                this.sseStreamer.streamSourceDocumentsEvent(this.chatId, outputs?.sourceDocuments)
             }
-            this.socketIO.to(this.socketIOClientId).emit('end')
+            if (this.sseStreamer) {
+                this.sseStreamer.streamEndEvent(this.chatId)
+            }
         } else {
-            if (this.returnSourceDocuments) {
-                this.socketIO.to(this.socketIOClientId).emit('sourceDocuments', outputs?.sourceDocuments)
+            if (this.returnSourceDocuments && this.sseStreamer) {
+                this.sseStreamer.streamSourceDocumentsEvent(this.chatId, outputs?.sourceDocuments)
             }
         }
+    }
+}
+
+class ExtendedLunaryHandler extends LunaryHandler {
+    chatId: string
+    appDataSource: DataSource
+    databaseEntities: IDatabaseEntity
+    currentRunId: string | null
+    thread: any
+    apiMessageId: string
+
+    constructor({ flowiseOptions, ...options }: any) {
+        super(options)
+        this.appDataSource = flowiseOptions.appDataSource
+        this.databaseEntities = flowiseOptions.databaseEntities
+        this.chatId = flowiseOptions.chatId
+        this.apiMessageId = flowiseOptions.apiMessageId
+    }
+
+    async initThread() {
+        const entity = await this.appDataSource.getRepository(this.databaseEntities['Lead']).findOne({
+            where: {
+                chatId: this.chatId
+            }
+        })
+
+        const userId = entity?.email ?? entity?.id
+
+        this.thread = lunary.openThread({
+            id: this.chatId,
+            userId,
+            userProps: userId
+                ? {
+                      name: entity?.name ?? undefined,
+                      email: entity?.email ?? undefined,
+                      phone: entity?.phone ?? undefined
+                  }
+                : undefined
+        })
+    }
+
+    async handleChainStart(chain: any, inputs: any, runId: string, parentRunId?: string, tags?: string[], metadata?: any): Promise<void> {
+        // First chain (no parent run id) is the user message
+        if (this.chatId && !parentRunId) {
+            if (!this.thread) {
+                await this.initThread()
+            }
+
+            const messageText = inputs.input || inputs.question
+
+            const messageId = this.thread.trackMessage({
+                content: messageText,
+                role: 'user'
+            })
+
+            // Track top level chain id for knowing when we got the final reply
+            this.currentRunId = runId
+
+            // Use the messageId as the parent of the chain for reconciliation
+            super.handleChainStart(chain, inputs, runId, messageId, tags, metadata)
+        } else {
+            super.handleChainStart(chain, inputs, runId, parentRunId, tags, metadata)
+        }
+    }
+
+    async handleChainEnd(outputs: ChainValues, runId: string): Promise<void> {
+        if (this.chatId && runId === this.currentRunId) {
+            const answer = outputs.output
+
+            this.thread.trackMessage({
+                id: this.apiMessageId,
+                content: answer,
+                role: 'assistant'
+            })
+
+            this.currentRunId = null
+        }
+
+        super.handleChainEnd(outputs, runId)
     }
 }
 
@@ -235,11 +357,17 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
                         apiKey: langSmithApiKey
                     })
 
-                    const tracer = new LangChainTracer({
+                    let langSmithField: LangChainTracerFields = {
                         projectName: langSmithProject ?? 'default',
                         //@ts-ignore
                         client
-                    })
+                    }
+
+                    if (nodeData?.inputs?.analytics?.langSmith) {
+                        langSmithField = { ...langSmithField, ...nodeData?.inputs?.analytics?.langSmith }
+                    }
+
+                    const tracer = new LangChainTracer(langSmithField)
                     callbacks.push(tracer)
                 } else if (provider === 'langFuse') {
                     const release = analytic[provider].release as string
@@ -248,27 +376,50 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
                     const langFusePublicKey = getCredentialParam('langFusePublicKey', credentialData, nodeData)
                     const langFuseEndpoint = getCredentialParam('langFuseEndpoint', credentialData, nodeData)
 
-                    const langFuseOptions: any = {
+                    let langFuseOptions: any = {
                         secretKey: langFuseSecretKey,
                         publicKey: langFusePublicKey,
-                        baseUrl: langFuseEndpoint ?? 'https://cloud.langfuse.com'
+                        baseUrl: langFuseEndpoint ?? 'https://cloud.langfuse.com',
+                        sdkIntegration: 'Flowise'
                     }
                     if (release) langFuseOptions.release = release
-                    if (options.chatId) langFuseOptions.userId = options.chatId
+                    if (options.chatId) langFuseOptions.sessionId = options.chatId
+
+                    if (nodeData?.inputs?.analytics?.langFuse) {
+                        langFuseOptions = { ...langFuseOptions, ...nodeData?.inputs?.analytics?.langFuse }
+                    }
 
                     const handler = new CallbackHandler(langFuseOptions)
                     callbacks.push(handler)
-                } else if (provider === 'llmonitor') {
-                    const llmonitorAppId = getCredentialParam('llmonitorAppId', credentialData, nodeData)
-                    const llmonitorEndpoint = getCredentialParam('llmonitorEndpoint', credentialData, nodeData)
+                } else if (provider === 'lunary') {
+                    const lunaryPublicKey = getCredentialParam('lunaryAppId', credentialData, nodeData)
+                    const lunaryEndpoint = getCredentialParam('lunaryEndpoint', credentialData, nodeData)
 
-                    const llmonitorFields: ICommonObject = {
-                        appId: llmonitorAppId,
-                        apiUrl: llmonitorEndpoint ?? 'https://app.llmonitor.com'
+                    let lunaryFields = {
+                        publicKey: lunaryPublicKey,
+                        apiUrl: lunaryEndpoint ?? 'https://api.lunary.ai',
+                        runtime: 'flowise',
+                        flowiseOptions: options
                     }
 
-                    const handler = new LLMonitorHandler(llmonitorFields)
+                    if (nodeData?.inputs?.analytics?.lunary) {
+                        lunaryFields = { ...lunaryFields, ...nodeData?.inputs?.analytics?.lunary }
+                    }
+
+                    const handler = new ExtendedLunaryHandler(lunaryFields)
+
                     callbacks.push(handler)
+                } else if (provider === 'langWatch') {
+                    const langWatchApiKey = getCredentialParam('langWatchApiKey', credentialData, nodeData)
+                    const langWatchEndpoint = getCredentialParam('langWatchEndpoint', credentialData, nodeData)
+
+                    const langwatch = new LangWatch({
+                        apiKey: langWatchApiKey,
+                        endpoint: langWatchEndpoint
+                    })
+
+                    const trace = langwatch.getTrace()
+                    callbacks.push(trace.getLangChainCallback())
                 }
             }
         }
@@ -322,19 +473,31 @@ export class AnalyticHandler {
                             secretKey: langFuseSecretKey,
                             publicKey: langFusePublicKey,
                             baseUrl: langFuseEndpoint ?? 'https://cloud.langfuse.com',
+                            sdkIntegration: 'Flowise',
                             release
                         })
                         this.handlers['langFuse'] = { client: langfuse }
-                    } else if (provider === 'llmonitor') {
-                        const llmonitorAppId = getCredentialParam('llmonitorAppId', credentialData, this.nodeData)
-                        const llmonitorEndpoint = getCredentialParam('llmonitorEndpoint', credentialData, this.nodeData)
+                    } else if (provider === 'lunary') {
+                        const lunaryPublicKey = getCredentialParam('lunaryAppId', credentialData, this.nodeData)
+                        const lunaryEndpoint = getCredentialParam('lunaryEndpoint', credentialData, this.nodeData)
 
-                        monitor.init({
-                            appId: llmonitorAppId,
-                            apiUrl: llmonitorEndpoint
+                        lunary.init({
+                            publicKey: lunaryPublicKey,
+                            apiUrl: lunaryEndpoint,
+                            runtime: 'flowise'
                         })
 
-                        this.handlers['llmonitor'] = { client: monitor }
+                        this.handlers['lunary'] = { client: lunary }
+                    } else if (provider === 'langWatch') {
+                        const langWatchApiKey = getCredentialParam('langWatchApiKey', credentialData, this.nodeData)
+                        const langWatchEndpoint = getCredentialParam('langWatchEndpoint', credentialData, this.nodeData)
+
+                        const langwatch = new LangWatch({
+                            apiKey: langWatchApiKey,
+                            endpoint: langWatchEndpoint
+                        })
+
+                        this.handlers['langWatch'] = { client: langwatch }
                     }
                 }
             }
@@ -347,7 +510,8 @@ export class AnalyticHandler {
         const returnIds: ICommonObject = {
             langSmith: {},
             langFuse: {},
-            llmonitor: {}
+            lunary: {},
+            langWatch: {}
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langSmith')) {
@@ -360,7 +524,8 @@ export class AnalyticHandler {
                     },
                     serialized: {},
                     project_name: this.handlers['langSmith'].langSmithProject,
-                    client: this.handlers['langSmith'].client
+                    client: this.handlers['langSmith'].client,
+                    ...this.nodeData?.inputs?.analytics?.langSmith
                 }
                 const parentRun = new RunTree(parentRunConfig)
                 await parentRun.postRun()
@@ -390,14 +555,20 @@ export class AnalyticHandler {
                 const langfuse: Langfuse = this.handlers['langFuse'].client
                 langfuseTraceClient = langfuse.trace({
                     name,
-                    userId: this.options.chatId,
-                    metadata: { tags: ['openai-assistant'] }
+                    sessionId: this.options.chatId,
+                    metadata: { tags: ['openai-assistant'] },
+                    ...this.nodeData?.inputs?.analytics?.langFuse
                 })
             } else {
                 langfuseTraceClient = this.handlers['langFuse'].trace[parentIds['langFuse']]
             }
 
             if (langfuseTraceClient) {
+                langfuseTraceClient.update({
+                    input: {
+                        text: input
+                    }
+                })
                 const span = langfuseTraceClient.span({
                     name,
                     input: {
@@ -411,19 +582,46 @@ export class AnalyticHandler {
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(this.handlers, 'llmonitor')) {
-            const monitor = this.handlers['llmonitor'].client
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
+            const monitor = this.handlers['lunary'].client
 
             if (monitor) {
                 const runId = uuidv4()
                 await monitor.trackEvent('chain', 'start', {
                     runId,
                     name,
-                    userId: this.options.chatId,
-                    input
+                    input,
+                    ...this.nodeData?.inputs?.analytics?.lunary
                 })
-                this.handlers['llmonitor'].chainEvent = { [runId]: runId }
-                returnIds['llmonitor'].chainEvent = runId
+                this.handlers['lunary'].chainEvent = { [runId]: runId }
+                returnIds['lunary'].chainEvent = runId
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            let langwatchTrace: LangWatchTrace
+
+            if (!parentIds || !Object.keys(parentIds).length) {
+                const langwatch: LangWatch = this.handlers['langWatch'].client
+                langwatchTrace = langwatch.getTrace({
+                    name,
+                    metadata: { tags: ['openai-assistant'], threadId: this.options.chatId },
+                    ...this.nodeData?.inputs?.analytics?.langWatch
+                })
+            } else {
+                langwatchTrace = this.handlers['langWatch'].trace[parentIds['langWatch']]
+            }
+
+            if (langwatchTrace) {
+                const span = langwatchTrace.startSpan({
+                    name,
+                    type: 'chain',
+                    input: autoconvertTypedValues(input)
+                })
+                this.handlers['langWatch'].trace = { [langwatchTrace.traceId]: langwatchTrace }
+                this.handlers['langWatch'].span = { [span.spanId]: span }
+                returnIds['langWatch'].trace = langwatchTrace.traceId
+                returnIds['langWatch'].span = span.spanId
             }
         }
 
@@ -449,6 +647,14 @@ export class AnalyticHandler {
                 span.end({
                     output
                 })
+                const langfuseTraceClient = this.handlers['langFuse'].trace[returnIds['langFuse'].trace]
+                if (langfuseTraceClient) {
+                    langfuseTraceClient.update({
+                        output: {
+                            output
+                        }
+                    })
+                }
                 if (shutdown) {
                     const langfuse: Langfuse = this.handlers['langFuse'].client
                     await langfuse.shutdownAsync()
@@ -456,14 +662,23 @@ export class AnalyticHandler {
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(this.handlers, 'llmonitor')) {
-            const chainEventId = returnIds['llmonitor'].chainEvent
-            const monitor = this.handlers['llmonitor'].client
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
+            const chainEventId = returnIds['lunary'].chainEvent
+            const monitor = this.handlers['lunary'].client
 
             if (monitor && chainEventId) {
                 await monitor.trackEvent('chain', 'end', {
                     runId: chainEventId,
                     output
+                })
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    output: autoconvertTypedValues(output)
                 })
             }
         }
@@ -490,6 +705,14 @@ export class AnalyticHandler {
                         error
                     }
                 })
+                const langfuseTraceClient = this.handlers['langFuse'].trace[returnIds['langFuse'].trace]
+                if (langfuseTraceClient) {
+                    langfuseTraceClient.update({
+                        output: {
+                            error
+                        }
+                    })
+                }
                 if (shutdown) {
                     const langfuse: Langfuse = this.handlers['langFuse'].client
                     await langfuse.shutdownAsync()
@@ -497,14 +720,23 @@ export class AnalyticHandler {
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(this.handlers, 'llmonitor')) {
-            const chainEventId = returnIds['llmonitor'].chainEvent
-            const monitor = this.handlers['llmonitor'].client
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
+            const chainEventId = returnIds['lunary'].chainEvent
+            const monitor = this.handlers['lunary'].client
 
             if (monitor && chainEventId) {
                 await monitor.trackEvent('chain', 'end', {
                     runId: chainEventId,
                     output: error
+                })
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    error
                 })
             }
         }
@@ -514,7 +746,8 @@ export class AnalyticHandler {
         const returnIds: ICommonObject = {
             langSmith: {},
             langFuse: {},
-            llmonitor: {}
+            lunary: {},
+            langWatch: {}
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langSmith')) {
@@ -538,16 +771,16 @@ export class AnalyticHandler {
             if (trace) {
                 const generation = trace.generation({
                     name,
-                    prompt: input
+                    input: input
                 })
                 this.handlers['langFuse'].generation = { [generation.id]: generation }
                 returnIds['langFuse'].generation = generation.id
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(this.handlers, 'llmonitor')) {
-            const monitor = this.handlers['llmonitor'].client
-            const chainEventId: string = this.handlers['llmonitor'].chainEvent[parentIds['llmonitor'].chainEvent]
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
+            const monitor = this.handlers['lunary'].client
+            const chainEventId: string = this.handlers['lunary'].chainEvent[parentIds['lunary'].chainEvent]
 
             if (monitor && chainEventId) {
                 const runId = uuidv4()
@@ -555,11 +788,22 @@ export class AnalyticHandler {
                     runId,
                     parentRunId: chainEventId,
                     name,
-                    userId: this.options.chatId,
                     input
                 })
-                this.handlers['llmonitor'].llmEvent = { [runId]: runId }
-                returnIds['llmonitor'].llmEvent = runId
+                this.handlers['lunary'].llmEvent = { [runId]: runId }
+                returnIds['lunary'].llmEvent = runId
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const trace: LangWatchTrace | undefined = this.handlers['langWatch'].trace[parentIds['langWatch'].trace]
+            if (trace) {
+                const span = trace.startLLMSpan({
+                    name,
+                    input: autoconvertTypedValues(input)
+                })
+                this.handlers['langWatch'].span = { [span.spanId]: span }
+                returnIds['langWatch'].span = span.spanId
             }
         }
 
@@ -583,19 +827,28 @@ export class AnalyticHandler {
             const generation: LangfuseGenerationClient | undefined = this.handlers['langFuse'].generation[returnIds['langFuse'].generation]
             if (generation) {
                 generation.end({
-                    completion: output
+                    output: output
                 })
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(this.handlers, 'llmonitor')) {
-            const llmEventId: string = this.handlers['llmonitor'].llmEvent[returnIds['llmonitor'].llmEvent]
-            const monitor = this.handlers['llmonitor'].client
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
+            const llmEventId: string = this.handlers['lunary'].llmEvent[returnIds['lunary'].llmEvent]
+            const monitor = this.handlers['lunary'].client
 
             if (monitor && llmEventId) {
                 await monitor.trackEvent('llm', 'end', {
                     runId: llmEventId,
                     output
+                })
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    output: autoconvertTypedValues(output)
                 })
             }
         }
@@ -618,19 +871,28 @@ export class AnalyticHandler {
             const generation: LangfuseGenerationClient | undefined = this.handlers['langFuse'].generation[returnIds['langFuse'].generation]
             if (generation) {
                 generation.end({
-                    completion: error
+                    output: error
                 })
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(this.handlers, 'llmonitor')) {
-            const llmEventId: string = this.handlers['llmonitor'].llmEvent[returnIds['llmonitor'].llmEvent]
-            const monitor = this.handlers['llmonitor'].client
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
+            const llmEventId: string = this.handlers['lunary'].llmEvent[returnIds['lunary'].llmEvent]
+            const monitor = this.handlers['lunary'].client
 
             if (monitor && llmEventId) {
                 await monitor.trackEvent('llm', 'end', {
                     runId: llmEventId,
                     output: error
+                })
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    error
                 })
             }
         }
@@ -640,7 +902,8 @@ export class AnalyticHandler {
         const returnIds: ICommonObject = {
             langSmith: {},
             langFuse: {},
-            llmonitor: {}
+            lunary: {},
+            langWatch: {}
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langSmith')) {
@@ -671,9 +934,9 @@ export class AnalyticHandler {
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(this.handlers, 'llmonitor')) {
-            const monitor = this.handlers['llmonitor'].client
-            const chainEventId: string = this.handlers['llmonitor'].chainEvent[parentIds['llmonitor'].chainEvent]
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
+            const monitor = this.handlers['lunary'].client
+            const chainEventId: string = this.handlers['lunary'].chainEvent[parentIds['lunary'].chainEvent]
 
             if (monitor && chainEventId) {
                 const runId = uuidv4()
@@ -681,11 +944,23 @@ export class AnalyticHandler {
                     runId,
                     parentRunId: chainEventId,
                     name,
-                    userId: this.options.chatId,
                     input
                 })
-                this.handlers['llmonitor'].toolEvent = { [runId]: runId }
-                returnIds['llmonitor'].toolEvent = runId
+                this.handlers['lunary'].toolEvent = { [runId]: runId }
+                returnIds['lunary'].toolEvent = runId
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const trace: LangWatchTrace | undefined = this.handlers['langWatch'].trace[parentIds['langWatch'].trace]
+            if (trace) {
+                const span = trace.startSpan({
+                    name,
+                    type: 'tool',
+                    input: autoconvertTypedValues(input)
+                })
+                this.handlers['langWatch'].span = { [span.spanId]: span }
+                returnIds['langWatch'].span = span.spanId
             }
         }
 
@@ -714,14 +989,23 @@ export class AnalyticHandler {
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(this.handlers, 'llmonitor')) {
-            const toolEventId: string = this.handlers['llmonitor'].toolEvent[returnIds['llmonitor'].toolEvent]
-            const monitor = this.handlers['llmonitor'].client
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
+            const toolEventId: string = this.handlers['lunary'].toolEvent[returnIds['lunary'].toolEvent]
+            const monitor = this.handlers['lunary'].client
 
             if (monitor && toolEventId) {
                 await monitor.trackEvent('tool', 'end', {
                     runId: toolEventId,
                     output
+                })
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    output: autoconvertTypedValues(output)
                 })
             }
         }
@@ -749,14 +1033,23 @@ export class AnalyticHandler {
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(this.handlers, 'llmonitor')) {
-            const toolEventId: string = this.handlers['llmonitor'].llmEvent[returnIds['llmonitor'].toolEvent]
-            const monitor = this.handlers['llmonitor'].client
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
+            const toolEventId: string = this.handlers['lunary'].llmEvent[returnIds['lunary'].toolEvent]
+            const monitor = this.handlers['lunary'].client
 
             if (monitor && toolEventId) {
                 await monitor.trackEvent('tool', 'end', {
                     runId: toolEventId,
                     output: error
+                })
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    error
                 })
             }
         }
